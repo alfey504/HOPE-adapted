@@ -21,7 +21,7 @@ class HOExpertObserver:
         expert interaction statistics during inference.
         Supported architectures: HuggingFace MoE models where MoE layers have
         `layer.mlp.experts` with stacked `gate_up_proj` and `down_proj` tensors
-        (e.g. Qwen3 MoE, Qwen3.5 MoE, GLM-4.5).
+        (e.g. Qwen3 MoE, Qwen3.5 MoE, GLM-4.5, OLMoE).
         Arguments:
             `model`: a loaded HuggingFace CausalLM model
             `stats_on_gpu`: if True, place accumulated tensors on the least-used
@@ -244,6 +244,25 @@ class HOExpertObserver:
         self.stats.clear()
 
 
+def encode_prompt(tokenizer, prompt):
+    """
+    Tokenizes a prompt string, applying the tokenizer's chat template (as a
+    single user turn) if it has one.
+    Arguments:
+        `tokenizer`: a HuggingFace tokenizer
+        `prompt`: a prompt string
+    Returns a list of token IDs.
+    """
+    if getattr(tokenizer, "chat_template", None):
+        text = tokenizer.apply_chat_template(
+            [{"role": "user", "content": prompt}],
+            add_generation_prompt=True,
+            tokenize=False,
+        )
+        return tokenizer(text, add_special_tokens=False)["input_ids"]
+    return tokenizer.encode(prompt)
+
+
 def calibrate(
     model_path, prompts, out_path, limit=None, seed=20260423,
     stats_on_cpu=False, max_prompt_length=None
@@ -273,18 +292,7 @@ def calibrate(
     # Tokenize if needed
     if prompts and isinstance(prompts[0], str):
         print("Tokenizing %d prompts..." % len(prompts))
-        input_ids_list = []
-        for p in prompts:
-            if hasattr(tokenizer, "apply_chat_template"):
-                text = tokenizer.apply_chat_template(
-                    [{"role": "user", "content": p}],
-                    add_generation_prompt=True,
-                    tokenize=False,
-                )
-                ids = tokenizer(text, add_special_tokens=False)["input_ids"]
-            else:
-                ids = tokenizer.encode(p)
-            input_ids_list.append(ids)
+        input_ids_list = [encode_prompt(tokenizer, p) for p in prompts]
     else:
         input_ids_list = list(prompts)
 
@@ -308,6 +316,17 @@ def calibrate(
 
     stats = observer.get_stats()
     observer.close()
+
+    # Low-precision models (e.g. float16 conversions of bfloat16 checkpoints)
+    # can overflow, which would silently corrupt the F-matrix
+    for layer_i, layer_stats in stats.items():
+        for key, val in layer_stats.items():
+            if not np.all(np.isfinite(val)):
+                raise ValueError(
+                    "Non-finite statistics (%s) in layer %d; the model may "
+                    "overflow in float16, try a bfloat16/float32 checkpoint"
+                    % (key, layer_i)
+                )
 
     # Save to HDF5
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)

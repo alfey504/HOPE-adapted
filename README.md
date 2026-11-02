@@ -25,6 +25,20 @@ pip install -e .
 
 HOPE uses a three-step pipeline: Calibrate, Solve, Prune
 
+### 0. (Optional) Download and convert a model
+
+`hope calibrate` and `hope prune` take a local model directory. To download a model from the HuggingFace Hub and save it in a different dtype:
+
+```bash
+python scripts/download_model.py \
+    --model-id allenai/OLMoE-1B-7B-0924 \
+    --out-path /path/to/olmoe-fp16 \
+    --dtype float16 \
+    --sanity-check
+```
+
+Use `--dtype float16` on GPUs without native bfloat16 support (e.g. T4, P100, V100), where it is considerably faster. Models trained in bfloat16 can overflow in float16; `--sanity-check` checks a short prompt, and `hope calibrate` raises an error if it collects non-finite statistics. If either happens, use `--dtype bfloat16` instead. The conversion needs roughly the model size in RAM, and twice the model size in disk space (HuggingFace cache + output).
+
 ### 1. Calibrate: Collect the F-matrix
 
 Run calibration prompts through your model to collect expert interaction statistics:
@@ -80,6 +94,26 @@ model = AutoModelForCausalLM.from_pretrained("/path/to/pruned-model")
 
 You may also prune your model with your own code instead of the script here (the main HOPE result is the prune-set JSON).
 
+### Evaluating on your own prompts
+
+Compare one or more pruned models against the original on a prompts file (same formats as `--prompts` above; no reference answers needed):
+
+```bash
+python scripts/eval_prompts.py \
+    --original /path/to/moe-model \
+    --pruned /path/to/pruned-model \
+    --prompts eval_prompts.txt \
+    --out-dir /path/to/eval
+```
+
+`--pruned` can be given several times (e.g. to compare HOPE against a baseline). Models are loaded one at a time. For each model it reports:
+- **perplexity** on the prompt tokens (lower is better)
+- **KL**: mean per-token KL divergence from the original's next-token distribution (lower is better)
+- **top1**: fraction of positions where the most likely next token matches the original's (higher is better)
+- **exact**: fraction of prompts where the greedy generation matches the original's exactly
+
+Results are written to `summary.json`, and per-prompt generations and metrics to `generations.jsonl`.
+
 ### First-order baselines
 
 HOPE's calibration data also supports several first-order baselines (REAP, EAN, MAN, freq):
@@ -121,6 +155,7 @@ HOPE's calibration step hooks into a HuggingFace MoE's expert Module. The observ
 - Qwen3-Next
 - Qwen3.5 MoE (e.g. Qwen3.5-35B-A3B, Qwen3.5-122B-A10B)
 - GLM-4.5-Air
+- OLMoE (e.g. OLMoE-1B-7B-0924)
 
 ## Citation
 

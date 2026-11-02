@@ -8,6 +8,7 @@ per layer.
 
 import os
 import json
+import shutil
 import torch
 import transformers
 
@@ -89,7 +90,7 @@ def _get_layers_and_config(model):
     if arch == "Qwen3_5MoeForConditionalGeneration":
         return model.model.language_model.layers, model.config.text_config
     if arch in ("Qwen3MoeForCausalLM", "Qwen3NextForCausalLM",
-                "Qwen3_5MoeForCausalLM"):
+                "Qwen3_5MoeForCausalLM", "OlmoeForCausalLM"):
         return model.model.layers, model.config
     if arch == "Glm4MoeForCausalLM":
         return model.model.layers, model.config
@@ -120,7 +121,7 @@ def prune_moe_layer(moe_block, retain_inds):
     # Prune router weights
     router.weight = torch.nn.Parameter(router.weight.data[inds_ten])
 
-    # Update Qwen3/Qwen3.5 attributes
+    # Update Qwen3/Qwen3.5/OLMoE attributes
     if hasattr(router, "num_experts"):
         router.num_experts = len(retain_inds)
 
@@ -138,7 +139,8 @@ def prune_moe_layer(moe_block, retain_inds):
 def _link_extra_files(src_path, dst_path):
     """
     Symlinks auxiliary files (defined in `EXTRA_FILES_TO_LINK`) from the given
-    source directory to the given destination directory. Skips files which do
+    source directory to the given destination directory, falling back to
+    copying if symlinks are not permitted. Skips files which do
     not exist at the source directory, and overwrites files which already exist
     at the destination directory.
     """
@@ -149,7 +151,11 @@ def _link_extra_files(src_path, dst_path):
             continue
         if os.path.exists(dst):
             os.remove(dst)
-        os.symlink(src, dst)
+        try:
+            os.symlink(src, dst)
+        except OSError:
+            # Symlinks may be unavailable (e.g. Windows without Developer Mode)
+            shutil.copy2(src, dst)
 
 
 def prune_model(src_model_path, pruneset_path, dst_model_path):
