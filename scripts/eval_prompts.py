@@ -11,11 +11,17 @@ the reference. For each model, reports:
     - exact-match rate: fraction of prompts where the greedy generation is
       identical to the original's
 
-Models are loaded one at a time, so only one needs to fit on the GPUs. The
-original's next-token log-probabilities are cached on disk (float16, roughly
-2 bytes x vocab size per prompt token) and deleted at the end. Because of the
-float16 cache, KL values below ~1e-3 (including slightly negative values) are
-within rounding error of 0.
+Models are loaded one at a time, so only one needs to fit on the GPUs.
+
+The original model's results (generations, perplexities, and next-token
+log-probabilities) are cached in `--original-cache-dir` and reused across runs,
+so evaluating new pruned models doesn't rerun the original. Entries are keyed
+by prompt tokens and `--max-new-tokens`, so changing `--limit` or adding
+prompts only computes the missing ones. The cache is cleared automatically if
+the original model's files change; use `--recompute-original` to force it. The
+log-probabilities are stored as float16 (roughly 2 bytes x vocab size per
+prompt token), so KL values below ~1e-3 (including slightly negative values)
+are within rounding error of 0.
 
 Outputs (in `--out-dir`):
     - `summary.json`: aggregate metrics per model
@@ -29,6 +35,8 @@ Usage:
 """
 
 import gc
+import glob
+import hashlib
 import json
 import math
 import os
@@ -67,8 +75,65 @@ def _load_model(path):
     return model
 
 
+def _model_fingerprint(path):
+    """
+    Returns a fingerprint of a model directory (path, config, and weight file
+    names/sizes/modification times), used to invalidate the original's cache.
+    """
+    with open(os.path.join(path, "config.json")) as f:
+        config = f.read()
+    weights = sorted(
+        glob.glob(os.path.join(path, "*.safetensors"))
+        + glob.glob(os.path.join(path, "*.bin"))
+    )
+    return {
+        "path": os.path.abspath(path),
+        "config": config,
+        "weights": [
+            [os.path.basename(w), os.path.getsize(w), os.path.getmtime(w)]
+            for w in weights
+        ],
+    }
+
+
+def _prompt_key(ids, max_new_tokens):
+    """
+    Returns the cache key for a tokenized prompt.
+    """
+    return hashlib.sha256(
+        json.dumps([ids, max_new_tokens]).encode()
+    ).hexdigest()
+
+
+def _prepare_cache(cache_dir, original, recompute):
+    """
+    Creates the original model's cache directory, clearing it if forced or if
+    the original model has changed since the cache was written.
+    """
+    meta_path = os.path.join(cache_dir, "meta.json")
+    fingerprint = _model_fingerprint(original)
+    if os.path.exists(cache_dir):
+        if recompute:
+            print("Clearing original model cache (--recompute-original)")
+            shutil.rmtree(cache_dir)
+        else:
+            meta = None
+            if os.path.exists(meta_path):
+                with open(meta_path) as f:
+                    meta = json.load(f)
+            if meta != fingerprint:
+                print(
+                    "Original model changed since the cache was written; "
+                    "clearing %s" % cache_dir
+                )
+                shutil.rmtree(cache_dir)
+    os.makedirs(cache_dir, exist_ok=True)
+    with open(meta_path, "w") as f:
+        json.dump(fingerprint, f)
+
+
 def _run_model(
-    path, name, tokenizer, input_ids_list, max_new_tokens, cache_dir,
+    path, name, tokenizer, input_ids_list, keys, max_new_tokens, cache_dir,
     is_original,
 ):
     """
@@ -79,7 +144,7 @@ def _run_model(
     model = _load_model(path)
     try:
         return _eval_model(
-            model, tokenizer, input_ids_list, max_new_tokens, cache_dir,
+            model, tokenizer, input_ids_list, keys, max_new_tokens, cache_dir,
             is_original, name,
         )
     finally:
@@ -91,12 +156,13 @@ def _run_model(
 
 @torch.no_grad()
 def _eval_model(
-    model, tokenizer, input_ids_list, max_new_tokens, cache_dir, is_original,
-    name,
+    model, tokenizer, input_ids_list, keys, max_new_tokens, cache_dir,
+    is_original, name,
 ):
     """
-    Runs a model over all prompts. For the original model, caches next-token
-    log-probs to `cache_dir`; for pruned models, compares against the cache.
+    Runs a model over the given prompts. For the original model, writes each
+    prompt's result and next-token log-probs to `cache_dir` (as
+    `<key>.pt`); for pruned models, compares against those entries.
     Returns a list of per-prompt result dictionaries.
     """
     pad_id = tokenizer.pad_token_id
@@ -104,8 +170,12 @@ def _eval_model(
         pad_id = tokenizer.eos_token_id
 
     results = []
-    for prompt_i, ids in enumerate(tqdm.tqdm(input_ids_list, desc=name)):
+    for ids, key in tqdm.tqdm(
+        list(zip(input_ids_list, keys)), desc=name
+    ):
         ids_ten = torch.tensor([ids], device=model.device)
+        cache_path = os.path.join(cache_dir, key + ".pt")
+        entry = {}
         res = {
             "nll_sum": None, "num_tokens": len(ids) - 1, "kl_sum": None,
             "agree_sum": None, "nonfinite": False,
@@ -122,26 +192,25 @@ def _eval_model(
                     1, targets[:, None]
                 ).sum().item()
 
-                cache_path = os.path.join(cache_dir, "%d.pt" % prompt_i)
                 if is_original:
                     # Argmax is stored separately, since float16 rounding can
                     # flip near-ties
-                    torch.save({
-                        "log_probs": log_probs.half().cpu(),
-                        "argmax": log_probs.argmax(-1).cpu(),
-                    }, cache_path)
-                elif os.path.exists(cache_path):
+                    entry["log_probs"] = log_probs.half().cpu()
+                    entry["argmax"] = log_probs.argmax(-1).cpu()
+                else:
                     cached = torch.load(cache_path)
-                    orig_log_probs = cached["log_probs"].to(
-                        log_probs.device
-                    ).float()
-                    res["kl_sum"] = (
-                        orig_log_probs.exp() * (orig_log_probs - log_probs)
-                    ).sum().item()
-                    res["agree_sum"] = (
-                        cached["argmax"].to(log_probs.device)
-                        == log_probs.argmax(-1)
-                    ).sum().item()
+                    if "log_probs" in cached:
+                        orig_log_probs = cached["log_probs"].to(
+                            log_probs.device
+                        ).float()
+                        res["kl_sum"] = (
+                            orig_log_probs.exp()
+                            * (orig_log_probs - log_probs)
+                        ).sum().item()
+                        res["agree_sum"] = (
+                            cached["argmax"].to(log_probs.device)
+                            == log_probs.argmax(-1)
+                        ).sum().item()
                 del logits, log_probs
 
         out = model.generate(
@@ -153,6 +222,13 @@ def _eval_model(
             out[0, len(ids):], skip_special_tokens=True
         )
         results.append(res)
+
+        if is_original:
+            # Write atomically so an interrupted run never leaves a partial
+            # entry behind
+            entry["result"] = res
+            torch.save(entry, cache_path + ".tmp")
+            os.replace(cache_path + ".tmp", cache_path)
 
     num_nonfinite = sum(r["nonfinite"] for r in results)
     if num_nonfinite:
@@ -248,9 +324,18 @@ def _fmt(val, spec):
     "--limit", type=int, default=None,
     help="if specified, only use the first this many prompts"
 )
+@click.option(
+    "--original-cache-dir", default=None,
+    help="directory to cache the original model's results in, reused across "
+    "runs; defaults to <out-dir>/original_cache"
+)
+@click.option(
+    "--recompute-original", is_flag=True,
+    help="if specified, clear the original model's cache and recompute it"
+)
 def main(
     original, pruned, prompts, out_dir, max_new_tokens, max_prompt_length,
-    limit,
+    limit, original_cache_dir, recompute_original,
 ):
     """
     Evaluate pruned models against the original model on a prompts file.
@@ -275,33 +360,47 @@ def main(
         names.append(name)
 
     os.makedirs(out_dir, exist_ok=True)
-    cache_dir = os.path.join(out_dir, "_orig_logprobs")
-    os.makedirs(cache_dir, exist_ok=True)
+    cache_dir = original_cache_dir or os.path.join(out_dir, "original_cache")
+    _prepare_cache(cache_dir, original, recompute_original)
 
-    total_tokens = sum(max(len(ids) - 1, 0) for ids in input_ids_list)
-    cache_gb = total_tokens * len(tokenizer) * 2 / 1e9
+    # Run the original model only on prompts that aren't cached yet
+    keys = [_prompt_key(ids, max_new_tokens) for ids in input_ids_list]
+    missing = [
+        i for i, key in enumerate(keys)
+        if not os.path.exists(os.path.join(cache_dir, key + ".pt"))
+    ]
     print(
-        "Evaluating %d prompts (%d tokens); log-prob cache needs ~%.1f GB"
-        % (len(input_ids_list), total_tokens, cache_gb)
+        "Evaluating %d prompts; original model results cached for %d/%d "
+        "(%s)" % (
+            len(keys), len(keys) - len(missing), len(keys), cache_dir
+        )
     )
-    if cache_gb > 10:
-        print(
-            "WARNING: large log-prob cache; consider --limit or "
-            "--max-prompt-length"
+    if missing:
+        missing_tokens = sum(
+            max(len(input_ids_list[i]) - 1, 0) for i in missing
+        )
+        cache_gb = missing_tokens * len(tokenizer) * 2 / 1e9
+        print("Caching original model results needs ~%.1f GB" % cache_gb)
+        if cache_gb > 10:
+            print(
+                "WARNING: large log-prob cache; consider --limit or "
+                "--max-prompt-length"
+            )
+        _run_model(
+            original, "original", tokenizer,
+            [input_ids_list[i] for i in missing], [keys[i] for i in missing],
+            max_new_tokens, cache_dir, True,
         )
 
-    try:
-        all_results = {"original": _run_model(
-            original, "original", tokenizer, input_ids_list, max_new_tokens,
-            cache_dir, True,
-        )}
-        for name, path in zip(names, pruned):
-            all_results[name] = _run_model(
-                path, name, tokenizer, input_ids_list, max_new_tokens,
-                cache_dir, False,
-            )
-    finally:
-        shutil.rmtree(cache_dir, ignore_errors=True)
+    all_results = {"original": [
+        torch.load(os.path.join(cache_dir, key + ".pt"))["result"]
+        for key in keys
+    ]}
+    for name, path in zip(names, pruned):
+        all_results[name] = _run_model(
+            path, name, tokenizer, input_ids_list, keys, max_new_tokens,
+            cache_dir, False,
+        )
 
     summary = {"original": _summarize(all_results["original"])}
     for name in names:

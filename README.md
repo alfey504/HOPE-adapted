@@ -114,6 +114,8 @@ python scripts/eval_prompts.py \
 
 Results are written to `summary.json`, and per-prompt generations and metrics to `generations.jsonl`.
 
+The original model's results are cached in `<out-dir>/original_cache` (or `--original-cache-dir`) and reused on later runs, so evaluating new pruned models doesn't rerun the original. Only new prompts are computed, and the cache is cleared automatically if the original model changes; pass `--recompute-original` to force a fresh run.
+
 ### First-order baselines
 
 HOPE's calibration data also supports several first-order baselines (REAP, EAN, MAN, freq):
