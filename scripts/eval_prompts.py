@@ -34,6 +34,11 @@ import math
 import os
 import shutil
 import click
+
+# Reduce CUDA memory fragmentation when loading models back to back; must be
+# set before torch initializes CUDA
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import torch
 import tqdm
 import transformers
@@ -62,14 +67,26 @@ def _load_model(path):
     return model
 
 
-def _unload(model):
+def _run_model(
+    path, name, tokenizer, input_ids_list, max_new_tokens, cache_dir,
+    is_original,
+):
     """
-    Frees a model's memory.
+    Loads a model, evaluates it with `_eval_model`, and frees its memory
+    before returning, so that only one model is ever on the GPUs.
     """
-    del model
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    print("Loading %s from %s ..." % (name, path))
+    model = _load_model(path)
+    try:
+        return _eval_model(
+            model, tokenizer, input_ids_list, max_new_tokens, cache_dir,
+            is_original, name,
+        )
+    finally:
+        del model
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 @torch.no_grad()
@@ -274,22 +291,15 @@ def main(
         )
 
     try:
-        print("Loading original model from %s ..." % original)
-        model = _load_model(original)
-        all_results = {"original": _eval_model(
-            model, tokenizer, input_ids_list, max_new_tokens, cache_dir,
-            True, "original",
+        all_results = {"original": _run_model(
+            original, "original", tokenizer, input_ids_list, max_new_tokens,
+            cache_dir, True,
         )}
-        _unload(model)
-
         for name, path in zip(names, pruned):
-            print("Loading %s from %s ..." % (name, path))
-            model = _load_model(path)
-            all_results[name] = _eval_model(
-                model, tokenizer, input_ids_list, max_new_tokens, cache_dir,
-                False, name,
+            all_results[name] = _run_model(
+                path, name, tokenizer, input_ids_list, max_new_tokens,
+                cache_dir, False,
             )
-            _unload(model)
     finally:
         shutil.rmtree(cache_dir, ignore_errors=True)
 
@@ -305,7 +315,7 @@ def main(
         for prompt_i, prompt in enumerate(prompt_list):
             row = {"prompt": prompt}
             for name, results in all_results.items():
-                row[name] = _per_prompt(results[prompt_i])
+                row[name] = _per_prompt(results[prompt_i]) #type:ignore
             f.write(json.dumps(row) + "\n")
 
     name_width = max(len(n) for n in summary)
